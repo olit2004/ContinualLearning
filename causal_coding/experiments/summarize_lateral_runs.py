@@ -18,7 +18,6 @@ import numpy as np
 def parse_runs(results_dir="results"):
     modes = ["off", "on"]
     data = {"off": [], "on": []}
-
     for mode in modes:
         pattern = os.path.join(results_dir, f"causal_coding_lat_{mode}_seed_*", "experiment_summary.json")
         for filepath in sorted(glob.glob(pattern)):
