@@ -1,15 +1,5 @@
-"""Runner script for Lateral Connection Ablation Experiment (OFF vs ON).
-
-Supports:
-- --lateral-mode {on, off}
-- --seed {int}
-- --epochs {int} (default 60, allows small values for smoke testing)
-- --smoke-test flag (sets 1 task, 2 epochs)
-
-Outputs are saved in isolated results directories under results/causal_coding_lat_{mode}_seed_{seed}.
-"""
-
 import argparse
+import csv
 import json
 import os
 import sys
@@ -27,29 +17,34 @@ from src.model import CausalCodingModel
 from src.method import CausalCodingMethod
 
 
-def compute_lateral_diagnostics(params):
-    """Compute summary norms of lateral parameters for diagnostics."""
-    lateral_U_list = params.get("lateral_U", [])
-    lateral_log_alpha_list = params.get("lateral_log_alpha", [])
-    
-    layer_diagnostics = []
-    for l_idx, (U, rho) in enumerate(zip(lateral_U_list, lateral_log_alpha_list)):
-        alpha_val = float(jax.nn.softplus(rho))
-        U_frob = float(jnp.linalg.norm(U))
-        UtU = U.T @ U
-        eigs = jnp.linalg.eigvalsh(UtU)
-        lambda_max = float(jnp.max(eigs)) if len(eigs) > 0 else 0.0
-        # Effective lateral matrix F-norm: ||alpha * U U^T||_F = alpha * ||U^T U||_F
-        lambda_frob = float(alpha_val * jnp.linalg.norm(UtU))
+def attach_lateral_trace(method):
+    """Trace lateral parameter dynamics across tasks without polluting method config."""
+    rows = []
+    original = method.train_task
+
+    def traced(model, params, state, task, task_idx, diagnostics_hook=None):
+        U_in = [np.asarray(U) for U in params.get("lateral_U", [])]
+        out = original(model, params, state, task, task_idx, diagnostics_hook)
+        protocol = "task_il" if getattr(method, "task_il_training", False) else "class_il"
         
-        layer_diagnostics.append({
-            "layer": l_idx,
-            "alpha": alpha_val,
-            "U_frob": U_frob,
-            "lambda_max": lambda_max,
-            "lambda_frob": lambda_frob,
-        })
-    return layer_diagnostics
+        for l, (U0, U, rho) in enumerate(zip(U_in, out[0].get("lateral_U", []), out[0].get("lateral_log_alpha", []))):
+            U = np.asarray(U)
+            alpha = float(jax.nn.softplus(rho))
+            UtU = U.T @ U
+            rows.append({
+                "protocol": protocol,
+                "task": task_idx + 1,
+                "layer": l + 1,
+                "alpha": alpha,
+                "U_fro": float(np.linalg.norm(U)),
+                "lambda_max": alpha * float(np.max(np.linalg.eigvalsh(UtU))),
+                "lambda_frob": alpha * float(np.linalg.norm(UtU)),
+                "rel_change_of_U": float(np.linalg.norm(U - U0) / (np.linalg.norm(U0) + 1e-12)),
+            })
+        return out
+
+    method.train_task = traced
+    return rows
 
 
 def main():
@@ -77,6 +72,11 @@ def main():
         action="store_true",
         help="Run quick smoke test (2 tasks, 2 epochs) to verify pipeline",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing output directory if it exists",
+    )
     args = parser.parse_args()
 
     lateral_enabled = (args.lateral_mode == "on")
@@ -85,6 +85,16 @@ def main():
     run_name = f"causal_coding_lat_{args.lateral_mode}_seed_{args.seed}"
     if args.smoke_test:
         run_name += "_smoke"
+
+    out_dir = os.path.join("results", run_name)
+    summary_file = os.path.join(out_dir, "experiment_summary.json")
+
+    # Overwrite protection guard
+    if os.path.exists(summary_file) and not args.force:
+        raise FileExistsError(
+            f"Results already exist at '{summary_file}'. "
+            f"Pass --force to overwrite."
+        )
 
     print(f"============================================================")
     print(f"Starting run: {run_name}")
@@ -95,7 +105,6 @@ def main():
     # Load dataset & create tasks
     X, y, test_X, test_y = load_mnist()
     if args.smoke_test:
-        # Use first 2 tasks for smoke test
         class_pairs = [[0, 1], [2, 3]]
     else:
         class_pairs = [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9]]
@@ -168,23 +177,30 @@ def main():
         vertical_importance_standardize_x=False,
     )
 
-    # Check initial lateral diagnostics
-    init_diag = compute_lateral_diagnostics(params)
-    print(f"\nInitial Lateral Diagnostics:")
-    for d in init_diag:
-        print(f"  Layer {d['layer']}: alpha={d['alpha']:.5f}, ||U||_F={d['U_frob']:.5f}, ||Lambda||_F={d['lambda_frob']:.5e}")
-
-    # Run CLBenchmark
+    # Benchmark initialization
     benchmark = CLBenchmark(method=method, model=model, tasks=tasks, name=run_name)
+
+    # Attach lateral trace wrapper strictly AFTER CLBenchmark init so vars(method)
+    # does not capture the wrapper function into benchmark config/JSON.
+    trace_rows = attach_lateral_trace(method)
+
     results = benchmark.run(params, None)
 
-    # Compute final lateral diagnostics
-    # Re-evaluate final params from benchmark if accessible or run diagnostic
-    out_dir = os.path.join("results", run_name)
-    diag_file = os.path.join(out_dir, "lateral_diagnostics.json")
-    
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Write lateral trajectory trace CSV
+    trace_file = os.path.join(out_dir, "lateral_trace.csv")
+    if trace_rows:
+        fieldnames = ["protocol", "task", "layer", "alpha", "U_fro", "lambda_max", "lambda_frob", "rel_change_of_U"]
+        with open(trace_file, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(trace_rows)
+
     # Extract final metrics of interest
     m = results.metrics
+    final_lateral_frob = trace_rows[-1]["lambda_frob"] if trace_rows else 0.0
+
     summary_report = {
         "run_name": run_name,
         "lateral_enabled": lateral_enabled,
@@ -194,10 +210,10 @@ def main():
         "task_il_fwt": m["task_il"]["forward_transfer"],
         "task_il_forgetting": m["task_il"]["forgetting"],
         "class_il_nll": m["class_il"]["average_nll"],
-        "initial_diagnostics": init_diag,
+        "final_lambda_frob": final_lateral_frob,
     }
-    
-    with open(os.path.join(out_dir, "experiment_summary.json"), "w") as f:
+
+    with open(summary_file, "w") as f:
         json.dump(summary_report, f, indent=4)
 
     print("\n============================================================")
@@ -206,7 +222,9 @@ def main():
     print(f"Task-IL BWT              : {m['task_il']['backward_transfer'] * 100:.2f}%")
     print(f"Task-IL FWT              : {m['task_il']['forward_transfer'] * 100:.2f}%")
     print(f"Class-IL NLL             : {m['class_il']['average_nll']:.4f}")
-    print(f"Summary saved to {os.path.join(out_dir, 'experiment_summary.json')}")
+    print(f"Final ||Lambda||_F       : {final_lateral_frob:.5e}")
+    print(f"Summary saved to {summary_file}")
+    print(f"Lateral trace saved to {trace_file}")
     print("============================================================\n")
 
 
