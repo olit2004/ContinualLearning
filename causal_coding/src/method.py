@@ -25,6 +25,7 @@ class CausalCodingMethod:
         k_probe=5,
 
         # Low-rank PSD hidden lateral precision.
+        lateral_enabled=True,
         lr_lat=1e-5,
         beta_cov=0.99,
         eps_lat=1e-2,
@@ -92,6 +93,7 @@ class CausalCodingMethod:
         self.k_probe = k_probe
 
         # Lateral precision optimization.
+        self.lateral_enabled = bool(lateral_enabled)
         self.lr_lat = lr_lat
         self.beta_cov = beta_cov
         self.eps_lat = eps_lat
@@ -219,7 +221,10 @@ class CausalCodingMethod:
             active_mask = jnp.ones(num_classes)
 
         for ep in range(self.epochs):
-            if task_idx == 0:
+            if not self.lateral_enabled:
+                lateral_force_scale = 0.0
+                lateral_lr_scale = 0.0
+            elif task_idx == 0:
                 lateral_force_scale = ramp_schedule(
                     ep, self.lat_warmup_epochs, self.lat_ramp_epochs
                 )

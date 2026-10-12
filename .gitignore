@@ -8,3 +8,7 @@ __pycache__/
 .ipynb_checkpoints/
 
 results/
+predictive_coding/
+naive.log
+result_predicitive_coding_log
+*.log
